@@ -10,7 +10,7 @@ jobs:
   checkin:
     name: GLaDOS 签到
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 25
     if: github.event_name != 'schedule' || github.event.schedule != '0 0 1 * *'
     concurrency:
       group: glados-checkin
@@ -28,10 +28,14 @@ jobs:
           python-version: '3.11'
 
       - name: Install dependencies
-        run: pip install "requests==2.32.3" --no-cache-dir
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq xvfb
+          pip install --no-cache-dir patchright
+          patchright install --with-deps chromium
 
-      - name: Run checkin
-        run: python checkin.py
+      - name: Run checkin (browser + Turnstile)
+        run: xvfb-run -a --server-args="-screen 0 1366x900x24" python checkin_browser.py
         env:
           COOKIES: ${{ secrets.COOKIES || vars.COOKIES }}
           SENDKEY: ${{ secrets.SENDKEY }}
@@ -50,6 +54,19 @@ jobs:
           # #9 积分兑换计划（可选；不配置则默认不兑换，不影响现有签到）
           EXCHANGE_PLAN: ${{ secrets.EXCHANGE_PLAN }}
           GLADOS_EXCHANGE_PLAN: ${{ secrets.GLADOS_EXCHANGE_PLAN }}
+          # 浏览器版参数：0=有头(配 xvfb)，1=无头
+          HEADLESS: "0"
+          DEBUG_SHOT: "1"
+          ACCOUNT_DELAY: "4"
+
+      - name: Upload debug screenshots
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-screenshots
+          path: debug/
+          if-no-files-found: ignore
+          retention-days: 7
 
   keepalive:
     name: 每月空提交保活

@@ -72,6 +72,26 @@ EXCHANGE_PLANS = {
     "plan500": {"points": 500, "days": 100},
 }
 
+# 在页面加载前注入：记录前端提交签到请求时的真实 body（含 tsState / turnstile 字段）
+JS_HOOK = r"""
+window.__wbPosts = [];
+(function () {
+  const orig = window.fetch;
+  window.fetch = function () {
+    try {
+      const a = arguments;
+      const u = a[0] && (a[0].url || a[0]);
+      const o = a[1] || {};
+      if (String(u).indexOf('/api/user/checkin') >= 0 &&
+          String(o.method || 'GET').toUpperCase() === 'POST') {
+        window.__wbPosts.push({ url: String(u), body: o.body || null });
+      }
+    } catch (e) {}
+    return orig.apply(this, arguments);
+  };
+})();
+"""
+
 # 同源查询：积分 / 剩余天数 / 邮箱
 JS_QUERY = r"""
 async () => {
@@ -216,36 +236,49 @@ def find_checkin_button(page):
     return None, ""
 
 
-def try_click_turnstile(page) -> bool:
+def try_click_turnstile(page) -> str:
     """
     尝试通过 Turnstile 的交互式 checkbox。
 
     appearance="interaction-only" 的 widget 是右上角浮层。Playwright 可跨域
-    操作 iframe（浏览器进程层面，不受同源策略限制），因此优先用语义选择器，
-    失败再回落到 iframe 内坐标点击。
+    操作 iframe（浏览器进程层面，不受同源策略限制），因此优先 iframe 内语义
+    点击，其次页面坐标精确点击（checkbox 在 widget 左侧约 16px、垂直居中）。
+
+    返回命中的方式描述，未命中返回空串（便于日志诊断）。
     """
     for fr in page.frames:
         if "challenges.cloudflare.com" not in (fr.url or ""):
             continue
-        # 1) 语义选择器
+        # 1) iframe 内语义选择器
         for sel in ('input[type="checkbox"]', '[role="checkbox"]',
                     '#challenge-stage input', 'label'):
             try:
                 loc = fr.locator(sel).first
                 if loc.count() > 0:
-                    loc.click(timeout=1500, force=True)
-                    return True
+                    loc.click(timeout=1200, force=True)
+                    return f"frame:{sel}"
             except Exception:
                 continue
-        # 2) iframe 内坐标点击（checkbox 在左侧、垂直居中）
-        for pos in ((24, 30), (32, 32), (44, 30)):
+        # 2) iframe 内坐标（body 可能很小，force 跳过可操作性检查）
+        for pos in ((22, 28), (28, 32)):
             try:
                 fr.click("body", position={"x": pos[0], "y": pos[1]},
-                         timeout=1200, force=True)
-                return True
+                         timeout=1000, force=True)
+                return f"frame-xy:{pos}"
             except Exception:
                 continue
-    return False
+
+    # 3) 页面坐标兜底：iframe 外框左上 + 16px 处即 checkbox
+    try:
+        el = page.query_selector('iframe[src*="challenges.cloudflare.com"]')
+        if el:
+            bb = el.bounding_box()
+            if bb and bb.get("width"):
+                page.mouse.click(bb["x"] + 16, bb["y"] + bb["height"] / 2)
+                return f"page-xy:{int(bb['x']+16)},{int(bb['y']+bb['height']/2)}"
+    except Exception:
+        pass
+    return ""
 
 
 def do_checkin(page, index: int) -> Dict[str, Any]:
@@ -286,15 +319,20 @@ def do_checkin(page, index: int) -> Dict[str, Any]:
 
     deadline = time.time() + 90
     ts_attempts = 0
+    hits: List[str] = []
     while time.time() < deadline:
         if captured.get("resp") is not None:
             break
-        # 交互式 Turnstile：持续重试（一次点不中很常见）
-        if ts_attempts < 15:
-            if try_click_turnstile(page):
+        # 交互式 Turnstile：高频重试（前端可能只等 2.5s 就放弃提交）
+        if ts_attempts < 40:
+            how = try_click_turnstile(page)
+            if how:
                 ts_attempts += 1
-                log(f"  账号 {index} 第 {ts_attempts} 次点击 Turnstile")
-        page.wait_for_timeout(1200)
+                if len(hits) < 3:
+                    hits.append(how)
+                if ts_attempts in (1, 5, 15, 30):
+                    log(f"  账号 {index} Turnstile 点击 x{ts_attempts} ({how})")
+        page.wait_for_timeout(250)
 
     resp = captured.get("resp")
     if resp is None:
@@ -322,7 +360,23 @@ def do_checkin(page, index: int) -> Dict[str, Any]:
         "code": code,
         "message": message,
         "result": j,
+        "ts_hits": hits,
     }
+    # 诊断：读出前端真正提交的 body，判断 turnstile 字段是否存在、tsState 是什么
+    try:
+        posts = page.evaluate("window.__wbPosts || []")
+        if posts:
+            import json as _json
+            raw = posts[-1].get("body") or ""
+            rec["post_body"] = str(raw)[:300]
+            try:
+                b = _json.loads(raw)
+                rec["ts_state"] = b.get("tsState")
+                rec["has_turnstile"] = bool(b.get("turnstile"))
+            except Exception:
+                pass
+    except Exception:
+        pass
     if reason == "turnstile":
         rec["message"] = message or "Turnstile 校验未通过"
     return rec
@@ -353,6 +407,7 @@ def checkin_account(browser, cookie: str, index: int, total: int,
             viewport={"width": 1366, "height": 900},
             extra_http_headers={"accept-language": "zh-CN,zh;q=0.9,en;q=0.8"},
         )
+        ctx.add_init_script(JS_HOOK)
         ctx.add_cookies(to_playwright_cookies(cookie))
         page = ctx.new_page()
         page.goto(CHECKIN_URL, wait_until="domcontentloaded", timeout=60000)
@@ -378,7 +433,15 @@ def checkin_account(browser, cookie: str, index: int, total: int,
                 "stage": r.get("stage") or "done",
                 "message": r.get("message") or "",
                 "result": r.get("result"),
+                "ts_state": r.get("ts_state"),
+                "has_turnstile": r.get("has_turnstile"),
+                "ts_hits": r.get("ts_hits"),
+                "post_body": r.get("post_body"),
             })
+            if r.get("ts_state") is not None or r.get("has_turnstile") is not None:
+                log(f"  账号 {index} 前端提交: tsState={r.get('ts_state')} "
+                    f"turnstile字段={'有' if r.get('has_turnstile') else '无'} "
+                    f"点击方式={r.get('ts_hits')}")
 
             # 同源补查积分/天数（不依赖 UI 文本）
             try:
@@ -437,6 +500,12 @@ def main() -> int:
         log("[FATAL] 未配置 COOKIES")
         return 2
 
+    # 调试用：只跑前 N 个账号
+    limit = int(os.getenv("LIMIT_ACCOUNTS", "0") or 0)
+    if limit > 0:
+        cookies = cookies[:limit]
+        log(f"[DEBUG] LIMIT_ACCOUNTS={limit}，仅处理前 {len(cookies)} 个账号")
+
     plan = (os.getenv("EXCHANGE_PLAN") or os.getenv("GLADOS_EXCHANGE_PLAN") or "").strip()
     if plan and plan not in EXCHANGE_PLANS:
         log(f"[WARN] EXCHANGE_PLAN={plan} 不合法，已忽略")
@@ -494,6 +563,10 @@ def main() -> int:
               f"{r['stage']}{ex}")
         if not r["ok"] and r.get("message"):
             print(f"        {r['message'][:160]}")
+        if r.get("ts_state") is not None or r.get("has_turnstile") is not None:
+            print(f"        tsState={r.get('ts_state')} | "
+                  f"turnstile={'有' if r.get('has_turnstile') else '无'} | "
+                  f"点击={r.get('ts_hits')}")
     print("=" * 66)
     log(f"成功 {ok_cnt}/{len(records)}")
 

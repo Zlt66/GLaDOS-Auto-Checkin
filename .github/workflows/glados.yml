@@ -60,6 +60,8 @@ jobs:
           HEADLESS: "0"
           DEBUG_SHOT: "1"
           ACCOUNT_DELAY: "4"
+          # 调试期只跑 1 个账号（0 = 全部）；正式使用时改回 0
+          LIMIT_ACCOUNTS: "1"
 
       - name: Upload debug screenshots
         if: failure()

@@ -379,12 +379,40 @@ def try_click_turnstile(page) -> str:
 
 def do_checkin(page, index: int) -> Dict[str, Any]:
     """
-    主路径：自实现协议（自己加载 SDK、自己渲染、自己决定等待时长）。
-    协议起不来时回落到点击官方 Checkin 按钮。
+    主路径：先借助官方按钮加载 Turnstile SDK（自己插 script 实测加载失败），
+    再由我们接管：自己取 challenge、自己 render、长时间等待 token、自己提交。
+    这样既拿到 SDK，又不受官方前端 2.5s 短超时限制。
     """
     hits: List[str] = []
 
-    # ---------- 主路径 ----------
+    # ---------- 0) 点一次官方按钮，只为让页面把 Turnstile SDK 载入 ----------
+    btn, label = find_checkin_button(page)
+    if btn is not None and not ALREADY_RE.search(label):
+        try:
+            btn.scroll_into_view_if_needed(timeout=5000)
+            btn.click(timeout=15000)
+            log(f"  账号 {index} 已点击按钮（用于加载 SDK）: {label!r}")
+        except Exception as e:
+            log(f"  账号 {index} 点击按钮失败: {type(e).__name__}")
+
+    ts_ready = False
+    for _ in range(30):
+        try:
+            if page.evaluate("!!window.turnstile"):
+                ts_ready = True
+                break
+        except Exception:
+            pass
+        page.wait_for_timeout(500)
+    log(f"  账号 {index} Turnstile SDK: {'就绪' if ts_ready else '未就绪'}")
+    if not ts_ready:
+        return {"ok": False, "stage": "no-sdk",
+                "message": "Turnstile SDK 未能加载（官方按钮也未成功触发）"}
+
+    # 给官方那条失败流程留出时间走完，避免两个流程互相干扰
+    page.wait_for_timeout(5000)
+
+    # ---------- 1) 接管：跑完整协议 ----------
     try:
         page.evaluate(JS_PROTOCOL, {"suffix": PROOF_SUFFIX, "sdk": TURNSTILE_SDK})
     except Exception as e:
@@ -444,60 +472,9 @@ def do_checkin(page, index: int) -> Dict[str, Any]:
             "protocol": True,
         }
 
-    # ---------- 回落：点击官方按钮 ----------
-    log(f"  账号 {index} 协议未完成({st.get('stage')})，回落到点击按钮")
-    captured: Dict[str, Any] = {}
-
-    def on_response(resp):
-        try:
-            if "/api/user/checkin" in resp.url and resp.request.method == "POST":
-                captured["resp"] = resp
-        except Exception:
-            pass
-
-    page.on("response", on_response)
-
-    btn, label = find_checkin_button(page)
-    if btn is None:
-        return {"ok": False, "stage": "no-button",
-                "message": f"协议阶段={st.get('stage')}，且未找到 Checkin 按钮"}
-    if ALREADY_RE.search(label):
-        return {"ok": True, "stage": "already", "message": f"按钮显示 {label!r}"}
-
-    try:
-        btn.scroll_into_view_if_needed(timeout=5000)
-        btn.click(timeout=20000)
-    except Exception as e:
-        return {"ok": False, "stage": "click-fail", "message": f"{type(e).__name__}: {e}"}
-
-    deadline2 = time.time() + 60
-    while time.time() < deadline2:
-        if captured.get("resp") is not None:
-            break
-        try_click_turnstile(page)
-        page.wait_for_timeout(400)
-
-    resp = captured.get("resp")
-    if resp is None:
-        return {"ok": False, "stage": "timeout",
-                "message": f"协议={st.get('stage')}，按钮点击后也未捕获到签到请求",
-                "ts_hits": hits}
-    try:
-        j = resp.json()
-    except Exception:
-        return {"ok": False, "stage": "non-json", "message": resp.text()[:200]}
-
-    code = j.get("code")
-    reason = j.get("reason")
-    ok = code in (0, 1)
-    return {
-        "ok": ok,
-        "stage": "done" if ok else f"reject:{reason or code}",
-        "code": code,
-        "message": j.get("message") or "",
-        "result": j,
-        "ts_hits": hits,
-    }
+    return {"ok": False, "stage": st.get("stage") or "protocol-timeout",
+            "message": f"协议未完成，JS 日志: {st.get('log')}",
+            "ts_hits": hits}
 
 
 # ---------------------------------------------------------------------------

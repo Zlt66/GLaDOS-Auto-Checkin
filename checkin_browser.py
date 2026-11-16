@@ -92,6 +92,102 @@ window.__wbPosts = [];
 })();
 """
 
+# 自实现协议：不受官方前端 2.5s 短超时的限制，可长时间等待 Turnstile
+# 结果写入 window.__wb，由 Python 侧轮询并在此期间持续点击 checkbox
+JS_PROTOCOL = r"""
+(args) => {
+  window.__wb = {done:false, ok:false, stage:'init', log:[], tsToken:null, result:null};
+  const W = window.__wb;
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
+  const push = s => { try { W.log.push(s); } catch (e) {} };
+
+  (async () => {
+    try {
+      // 1) 确保 Turnstile SDK（页面无 CSP，可自行注入；轮询而非仅依赖 onload）
+      if (!window.turnstile) {
+        await new Promise(res => {
+          const s = document.createElement('script');
+          s.src = args.sdk;
+          s.async = true;
+          s.onload = res;
+          s.onerror = res;          // 不阻断，交给后面的轮询判断
+          document.head.appendChild(s);
+          setTimeout(res, 12000);
+        });
+        for (let i = 0; i < 40 && !window.turnstile; i++) await sleep(500);
+      }
+      if (!window.turnstile) { W.stage = 'no-sdk'; W.done = true; return; }
+      push('sdk-ok');
+
+      // 2) 取 challenge
+      const cr = await fetch('/api/user/checkin/challenge',
+                             {credentials:'include', headers:{accept:'application/json'}});
+      const cj = await cr.json();
+      if (cj.code !== 0) { W.stage = 'challenge-fail'; W.chal = cj; W.done = true; return; }
+      const nonce = cj.nonce || (cj.data && cj.data.nonce);
+      const sitekey = cj.turnstile || (cj.data && cj.data.turnstile);
+      if (!nonce || !sitekey) { W.stage = 'challenge-malformed'; W.done = true; return; }
+      push('challenge-ok');
+
+      // 3) 自己渲染 widget（放在可见位置，便于点击）
+      const box = document.createElement('div');
+      box.id = '__wb_box';
+      box.style.cssText = 'position:fixed;left:12px;top:12px;z-index:2147483647;'
+                        + 'background:#fff;padding:6px;border-radius:6px';
+      document.body.appendChild(box);
+      try {
+        window.turnstile.render(box, {
+          sitekey: sitekey,
+          action: 'checkin',
+          cData: nonce,
+          appearance: 'interaction-only',
+          theme: 'light',
+          callback: t => { W.tsToken = t; W.stage = 'token-ok'; push('token'); },
+          'error-callback': e => push('ts-error:' + (e || '')),
+          'timeout-callback': () => push('ts-timeout'),
+        });
+      } catch (e) { push('render-throw:' + (e && e.message)); }
+      W.stage = 'waiting';
+
+      // 4) 长等待：Python 侧会持续点击 checkbox，最长 100 秒
+      const t0 = Date.now();
+      while (!W.tsToken && Date.now() - t0 < 100000) { await sleep(300); }
+      if (!W.tsToken) { W.stage = 'token-timeout'; W.done = true; return; }
+      push('token-got');
+
+      // 5) 服务端要求 challenge 生成到提交至少 2500ms
+      await sleep(2700);
+
+      // 6) proof = sha256(nonce + "." + suffix)
+      const buf = await crypto.subtle.digest(
+        'SHA-256', new TextEncoder().encode(nonce + '.' + args.suffix));
+      const proof = Array.from(new Uint8Array(buf))
+        .map(b => b.toString(16).padStart(2, '0')).join('');
+
+      // 7) 提交
+      const pr = await fetch('/api/user/checkin', {
+        method: 'POST', credentials: 'include',
+        headers: { 'content-type': 'application/json', accept: 'application/json' },
+        body: JSON.stringify({
+          token: location.hostname, nonce, proof, tsState: 'ok', turnstile: W.tsToken
+        })
+      });
+      const pj = await pr.json();
+      W.result = pj;
+      W.ok = (pj.code === 0) || (pj.code === 1);
+      W.stage = W.ok ? 'done' : ('reject:' + (pj.reason || pj.code));
+    } catch (e) {
+      W.stage = 'exception:' + (e && e.message ? e.message : String(e));
+    } finally {
+      W.done = true;
+    }
+  })();
+}
+"""
+
+PROOF_SUFFIX = "glados-observe-v1"   # 前端 bundle 字符码混淆还原所得
+TURNSTILE_SDK = "https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit"
+
 # 同源查询：积分 / 剩余天数 / 邮箱
 JS_QUERY = r"""
 async () => {
@@ -282,8 +378,75 @@ def try_click_turnstile(page) -> str:
 
 
 def do_checkin(page, index: int) -> Dict[str, Any]:
+    """
+    主路径：自实现协议（自己加载 SDK、自己渲染、自己决定等待时长）。
+    协议起不来时回落到点击官方 Checkin 按钮。
+    """
+    hits: List[str] = []
+
+    # ---------- 主路径 ----------
+    try:
+        page.evaluate(JS_PROTOCOL, {"suffix": PROOF_SUFFIX, "sdk": TURNSTILE_SDK})
+    except Exception as e:
+        log(f"  账号 {index} 注入协议失败: {type(e).__name__}: {e}")
+
+    deadline = time.time() + 150
+    last_stage = ""
+    ts_attempts = 0
+    while time.time() < deadline:
+        try:
+            st = page.evaluate("window.__wb")
+        except Exception:
+            st = None
+        if not st:
+            page.wait_for_timeout(600)
+            continue
+
+        stage = st.get("stage") or ""
+        if stage != last_stage:
+            last_stage = stage
+            log(f"  账号 {index} 阶段: {stage}")
+        if st.get("done"):
+            break
+
+        # 等 token 期间持续点 checkbox（CF 的行为分析需要几秒）
+        if stage == "waiting" and ts_attempts < 200:
+            how = try_click_turnstile(page)
+            if how:
+                ts_attempts += 1
+                if ts_attempts in (1, 10, 40, 100):
+                    log(f"  账号 {index} 点击 Turnstile x{ts_attempts} ({how})")
+                if len(hits) < 3:
+                    hits.append(how)
+        page.wait_for_timeout(400)
+
+    try:
+        st = page.evaluate("window.__wb") or {}
+    except Exception:
+        st = {}
+
+    if st.get("done"):
+        result = st.get("result") or {}
+        code = result.get("code")
+        msg = result.get("message") or ""
+        if not st.get("ok") and result.get("reason") == "turnstile":
+            msg = msg or "Turnstile 校验未通过"
+        return {
+            "ok": bool(st.get("ok")),
+            "stage": st.get("stage") or "done",
+            "code": code,
+            "message": msg,
+            "result": result,
+            "ts_hits": hits,
+            "ts_state": "ok" if st.get("tsToken") else None,
+            "has_turnstile": bool(st.get("tsToken")),
+            "ws_log": st.get("log"),
+            "protocol": True,
+        }
+
+    # ---------- 回落：点击官方按钮 ----------
+    log(f"  账号 {index} 协议未完成({st.get('stage')})，回落到点击按钮")
     captured: Dict[str, Any] = {}
-    errors: List[str] = []
 
     def on_response(resp):
         try:
@@ -292,94 +455,49 @@ def do_checkin(page, index: int) -> Dict[str, Any]:
         except Exception:
             pass
 
-    def on_failed(req):
-        try:
-            if "/api/user/checkin" in req.url:
-                errors.append(f"{req.failure}")
-        except Exception:
-            pass
-
     page.on("response", on_response)
-    page.on("requestfailed", on_failed)
 
     btn, label = find_checkin_button(page)
     if btn is None:
-        return {"ok": False, "stage": "no-button", "message": "页面上未找到 Checkin 按钮"}
-
-    log(f"  账号 {index} 找到按钮: {label!r}")
+        return {"ok": False, "stage": "no-button",
+                "message": f"协议阶段={st.get('stage')}，且未找到 Checkin 按钮"}
     if ALREADY_RE.search(label):
         return {"ok": True, "stage": "already", "message": f"按钮显示 {label!r}"}
 
     try:
         btn.scroll_into_view_if_needed(timeout=5000)
         btn.click(timeout=20000)
-        log(f"  账号 {index} 已点击，等待结果...")
     except Exception as e:
         return {"ok": False, "stage": "click-fail", "message": f"{type(e).__name__}: {e}"}
 
-    deadline = time.time() + 90
-    ts_attempts = 0
-    hits: List[str] = []
-    while time.time() < deadline:
+    deadline2 = time.time() + 60
+    while time.time() < deadline2:
         if captured.get("resp") is not None:
             break
-        # 交互式 Turnstile：高频重试（前端可能只等 2.5s 就放弃提交）
-        if ts_attempts < 40:
-            how = try_click_turnstile(page)
-            if how:
-                ts_attempts += 1
-                if len(hits) < 3:
-                    hits.append(how)
-                if ts_attempts in (1, 5, 15, 30):
-                    log(f"  账号 {index} Turnstile 点击 x{ts_attempts} ({how})")
-        page.wait_for_timeout(250)
+        try_click_turnstile(page)
+        page.wait_for_timeout(400)
 
     resp = captured.get("resp")
     if resp is None:
-        msg = "未捕获到签到请求"
-        if errors:
-            msg += f"（请求失败: {errors[0]}）"
-        return {"ok": False, "stage": "timeout", "message": msg}
-
+        return {"ok": False, "stage": "timeout",
+                "message": f"协议={st.get('stage')}，按钮点击后也未捕获到签到请求",
+                "ts_hits": hits}
     try:
         j = resp.json()
     except Exception:
-        try:
-            body = resp.text()[:200]
-        except Exception:
-            body = "<无响应体>"
-        return {"ok": False, "stage": "non-json", "message": body}
+        return {"ok": False, "stage": "non-json", "message": resp.text()[:200]}
 
     code = j.get("code")
     reason = j.get("reason")
-    message = j.get("message") or ""
     ok = code in (0, 1)
-    rec = {
+    return {
         "ok": ok,
         "stage": "done" if ok else f"reject:{reason or code}",
         "code": code,
-        "message": message,
+        "message": j.get("message") or "",
         "result": j,
         "ts_hits": hits,
     }
-    # 诊断：读出前端真正提交的 body，判断 turnstile 字段是否存在、tsState 是什么
-    try:
-        posts = page.evaluate("window.__wbPosts || []")
-        if posts:
-            import json as _json
-            raw = posts[-1].get("body") or ""
-            rec["post_body"] = str(raw)[:300]
-            try:
-                b = _json.loads(raw)
-                rec["ts_state"] = b.get("tsState")
-                rec["has_turnstile"] = bool(b.get("turnstile"))
-            except Exception:
-                pass
-    except Exception:
-        pass
-    if reason == "turnstile":
-        rec["message"] = message or "Turnstile 校验未通过"
-    return rec
 
 
 # ---------------------------------------------------------------------------
@@ -412,7 +530,7 @@ def checkin_account(browser, cookie: str, index: int, total: int,
         page = ctx.new_page()
         page.goto(CHECKIN_URL, wait_until="domcontentloaded", timeout=60000)
 
-        # 等前端渲染出签到面板（有按钮即视为就绪）
+        # 等页面基本就绪（协议路径不强依赖按钮，只作参考）
         ready = False
         for _ in range(30):
             if find_checkin_button(page)[0] is not None:
@@ -420,13 +538,13 @@ def checkin_account(browser, cookie: str, index: int, total: int,
                 break
             page.wait_for_timeout(500)
         if not ready:
-            page.wait_for_timeout(3000)  # 再给一次机会
+            page.wait_for_timeout(3000)
             ready = find_checkin_button(page)[0] is not None
+            if not ready:
+                log(f"  账号 {index} 未找到签到按钮，仍尝试协议路径")
 
-        if not ready:
-            rec["stage"] = "page-not-ready"
-            rec["message"] = "页面未渲染出签到面板（可能 Cookie 失效或页面改版）"
-        else:
+        # 协议路径不依赖按钮存在，始终执行签到
+        if True:
             r = do_checkin(page, index)
             rec.update({
                 "ok": bool(r.get("ok")),
@@ -436,12 +554,12 @@ def checkin_account(browser, cookie: str, index: int, total: int,
                 "ts_state": r.get("ts_state"),
                 "has_turnstile": r.get("has_turnstile"),
                 "ts_hits": r.get("ts_hits"),
-                "post_body": r.get("post_body"),
+                "ws_log": r.get("ws_log"),
             })
-            if r.get("ts_state") is not None or r.get("has_turnstile") is not None:
-                log(f"  账号 {index} 前端提交: tsState={r.get('ts_state')} "
-                    f"turnstile字段={'有' if r.get('has_turnstile') else '无'} "
-                    f"点击方式={r.get('ts_hits')}")
+            if r.get("has_turnstile") is not None:
+                log(f"  账号 {index} 结果: ok={r.get('ok')} "
+                    f"turnstile={'拿到' if r.get('has_turnstile') else '未拿到'} "
+                    f"点击={r.get('ts_hits')} js日志={r.get('ws_log')}")
 
             # 同源补查积分/天数（不依赖 UI 文本）
             try:

@@ -14,7 +14,7 @@
 - 📬 8 种推送渠道：PushDeer / Server酱 / Telegram / PushPlus / 钉钉 / 飞书 / 企业微信 / 云湖
 - 🔄 网络请求自动重试（指数退避）
 - 🔒 日志脱敏（邮箱/Cookie 自动隐藏）
-- ✅ Cookie 格式预验证
+- ✅ Cookie 结构预验证（前缀无关，自动兼容 `koa:` / `gld:` 等任意前缀）
 - 🔧 每月自动空提交保活
 - 💎 积分自动兑换（可选，消耗积分兑换会员天数）
 - 🆓 完全免费
@@ -52,12 +52,13 @@
 gld:sess=xxxxxx; gld:sess.sig=yyyyyy
 ```
 
-老版本签发的 `koa:sess=xxxxxx; koa:sess.sig=yyyyyy` 同样支持，两种前缀任选其一。
+旧版签发的 `koa:sess=xxxxxx; koa:sess.sig=yyyyyy` 同样支持，**两种前缀任选其一，无需手动转换**。
 
 ⚠️ **必须是完整的一整段**，且 `sess` 与 `sess.sig` 两个字段**必须同时存在、前缀一致**。
 只复制其中一个会导致签到失败（脚本会明确指出缺少哪个字段）。
 
-> 💡 两种前缀无需手动转换。脚本会自动识别实际传入的键名，
+> 💡 脚本采用**结构校验**：只校验「`<前缀>:sess` 与同前缀 `:sess.sig` 成对」，
+> 不写死具体前缀。因此 GLaDOS 即便再次变更前缀名，脚本也能自动识别，无需修改代码。
 > **不要把 `gld:` 改成 `koa:`** —— 改前缀会让服务端无法识别 session，导致「没有权限」。
 
 ---
@@ -135,29 +136,6 @@ cookie_账号3
 
 ---
 
-## 💻 本地运行
-
-不依赖 GitHub Actions 也能直接跑：
-
-```bash
-pip install "requests==2.32.3"
-
-# Windows PowerShell
-$env:COOKIES="gld:sess=xxxxxx; gld:sess.sig=yyyyyy"
-python checkin.py
-
-# Linux / macOS
-export COOKIES="gld:sess=xxxxxx; gld:sess.sig=yyyyyy"
-python checkin.py
-```
-
-多账号用 `|||` 分隔：`cookie1 ||| cookie2`（`&` 或换行也可以）。
-
-退出码含义：`0` = 至少一个账号签到成功或今日已签到；
-`1` = 全部账号失败，或未配置 `COOKIES`（非零退出码便于在 CI 中及时发现问题）。
-
----
-
 ## ⏰ 签到时间
 
 每天 **UTC 04:00**（北京时间 **中午 12 点**）自动运行。
@@ -176,9 +154,16 @@ python checkin.py
 
 ## ❓ 常见问题
 
-**Q: 签到提示 Cookie 失效？**
+**Q: 签到提示「没有权限」/ 鉴权失败？**
 
-A: Cookie 有有效期，请重新登录获取最新 Cookie 并更新 Secrets。
+A: 说明 Cookie 已失效或复制不完整，**请重新登录 GLaDOS 获取最新 Cookie 并更新 Secrets 中的 `COOKIES`**。
+若日志提示「会话字段不成对」或输出了「实际键名」，则多为复制遗漏了 `sess` / `sess.sig` 其中之一，重新完整复制即可。
+
+> 💡 脚本会自动识别 `koa:` / `gld:` 等任意前缀，**无需手动修改前缀**；反之，手动把前缀改错（如把 `gld:` 改成 `koa:`）会让服务端无法识别 session。
+
+**Q: Cookie 有有效期吗？**
+
+A: 有。Cookie 会随会话过期，需重新登录获取最新 Cookie 并更新 Secrets。
 
 **Q: Actions 被暂停了？**
 
@@ -195,6 +180,20 @@ A: 可以，配置多个 Secrets 即可同时推送。
 ---
 
 ## 🔄 更新日志
+
+### v2.1.1
+
+**问题修复**
+- 修复 GLaDOS 变更 Cookie 前缀（`koa:sess` → `gld:sess`）导致的签到失败：`validate_cookie` 原先把 `koa:sess` 写死校验，新版 Cookie 被误判为「缺少必要字段」，签到请求根本未发出，表现为「❌ 失败(没有权限)」
+
+**优化改进**
+- Cookie 校验改为**前缀无关的结构校验**：只校验「`<任意前缀>:sess` 与同前缀 `:sess.sig` 成对」，不再枚举任何前缀名——GLaDOS 未来再次变更前缀通常无需改代码即可自动适配
+- 新增 `normalize_cookie`：自动剥离粘贴时混入的首尾引号、空白与 `Cookie:` 头名
+- 新增自诊断日志：校验成功时打印识别到的会话前缀；失败时输出**实际解析到的键名**，前缀变化可一眼定位
+- 服务端鉴权失败（没有权限 / 未登录等）与格式错误分开提示，明确引导「重新获取 Cookie」
+- `glados.yml`：`COOKIES` 支持 `secrets` 与 `vars` 双路读取
+
+---
 
 ### v2.1.0
 

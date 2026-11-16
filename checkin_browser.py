@@ -377,42 +377,60 @@ def try_click_turnstile(page) -> str:
     return ""
 
 
-def do_checkin(page, index: int) -> Dict[str, Any]:
+def ensure_turnstile(page, index: int) -> bool:
     """
-    主路径：先借助官方按钮加载 Turnstile SDK（自己插 script 实测加载失败），
-    再由我们接管：自己取 challenge、自己 render、长时间等待 token、自己提交。
-    这样既拿到 SDK，又不受官方前端 2.5s 短超时限制。
+    确保 window.turnstile 可用。两条路：
+      A. Playwright 原生 add_script_tag（比手动 createElement 更可靠）
+      B. 点官方按钮，让它自己加载（点击后页面可能导航，故检测要快、要容错）
     """
-    hits: List[str] = []
+    # ---- A ----
+    try:
+        page.add_script_tag(url=TURNSTILE_SDK)
+    except Exception as e:
+        log(f"  账号 {index} add_script_tag 异常: {type(e).__name__}: {e}")
+    for _ in range(20):
+        try:
+            if page.evaluate("!!window.turnstile"):
+                log(f"  账号 {index} SDK 就绪（add_script_tag）")
+                return True
+        except Exception:
+            pass
+        page.wait_for_timeout(300)
 
-    # ---------- 0) 点一次官方按钮，只为让页面把 Turnstile SDK 载入 ----------
+    # ---- B ----
+    log(f"  账号 {index} SDK 仍未就绪，改由按钮触发")
     btn, label = find_checkin_button(page)
     if btn is not None and not ALREADY_RE.search(label):
         try:
-            btn.scroll_into_view_if_needed(timeout=5000)
-            btn.click(timeout=15000)
-            log(f"  账号 {index} 已点击按钮（用于加载 SDK）: {label!r}")
+            btn.click(timeout=10000)
         except Exception as e:
-            log(f"  账号 {index} 点击按钮失败: {type(e).__name__}")
+            log(f"  账号 {index} 点击异常: {type(e).__name__}")
+        for _ in range(30):
+            try:
+                if page.evaluate("!!window.turnstile"):
+                    log(f"  账号 {index} SDK 就绪（按钮触发）")
+                    return True
+            except Exception:
+                pass
+            page.wait_for_timeout(200)
+    return False
 
-    ts_ready = False
-    for _ in range(30):
-        try:
-            if page.evaluate("!!window.turnstile"):
-                ts_ready = True
-                break
-        except Exception:
-            pass
-        page.wait_for_timeout(500)
-    log(f"  账号 {index} Turnstile SDK: {'就绪' if ts_ready else '未就绪'}")
-    if not ts_ready:
+
+def do_checkin(page, index: int) -> Dict[str, Any]:
+    """
+    先确保 Turnstile SDK 可用，再接管流程：自己取 challenge、自己 render、
+    长时间等待 token、自己算 proof 并提交。绕开官方前端 2.5s 的短超时。
+    """
+    hits: List[str] = []
+
+    if not ensure_turnstile(page, index):
         return {"ok": False, "stage": "no-sdk",
-                "message": "Turnstile SDK 未能加载（官方按钮也未成功触发）"}
+                "message": "Turnstile SDK 无法加载（原生注入与按钮触发均失败）"}
 
-    # 给官方那条失败流程留出时间走完，避免两个流程互相干扰
-    page.wait_for_timeout(5000)
+    # 若刚才点过按钮，给官方那条失败流程一点时间走完
+    page.wait_for_timeout(3000)
 
-    # ---------- 1) 接管：跑完整协议 ----------
+    # ---------- 接管：跑完整协议 ----------
     try:
         page.evaluate(JS_PROTOCOL, {"suffix": PROOF_SUFFIX, "sdk": TURNSTILE_SDK})
     except Exception as e:

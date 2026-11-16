@@ -52,8 +52,10 @@ jobs:
           YUNHU_RECV_ID: ${{ secrets.YUNHU_RECV_ID }}
           YUNHU_RECV_TYPE: ${{ secrets.YUNHU_RECV_TYPE }}
           # #9 积分兑换计划（可选；不配置则默认不兑换，不影响现有签到）
-          EXCHANGE_PLAN: ${{ secrets.EXCHANGE_PLAN }}
-          GLADOS_EXCHANGE_PLAN: ${{ secrets.GLADOS_EXCHANGE_PLAN }}
+          # 测试期临时禁用兑换（避免每次试跑都消耗 100 积分）
+          # 验证通过合并回 main 时再恢复为：secret.EXCHANGE_PLAN
+          EXCHANGE_PLAN: ""
+          GLADOS_EXCHANGE_PLAN: ""
           # 浏览器版参数：0=有头(配 xvfb)，1=无头
           HEADLESS: "0"
           DEBUG_SHOT: "1"

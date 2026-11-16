@@ -216,6 +216,38 @@ def find_checkin_button(page):
     return None, ""
 
 
+def try_click_turnstile(page) -> bool:
+    """
+    尝试通过 Turnstile 的交互式 checkbox。
+
+    appearance="interaction-only" 的 widget 是右上角浮层。Playwright 可跨域
+    操作 iframe（浏览器进程层面，不受同源策略限制），因此优先用语义选择器，
+    失败再回落到 iframe 内坐标点击。
+    """
+    for fr in page.frames:
+        if "challenges.cloudflare.com" not in (fr.url or ""):
+            continue
+        # 1) 语义选择器
+        for sel in ('input[type="checkbox"]', '[role="checkbox"]',
+                    '#challenge-stage input', 'label'):
+            try:
+                loc = fr.locator(sel).first
+                if loc.count() > 0:
+                    loc.click(timeout=1500, force=True)
+                    return True
+            except Exception:
+                continue
+        # 2) iframe 内坐标点击（checkbox 在左侧、垂直居中）
+        for pos in ((24, 30), (32, 32), (44, 30)):
+            try:
+                fr.click("body", position={"x": pos[0], "y": pos[1]},
+                         timeout=1200, force=True)
+                return True
+            except Exception:
+                continue
+    return False
+
+
 def do_checkin(page, index: int) -> Dict[str, Any]:
     captured: Dict[str, Any] = {}
     errors: List[str] = []
@@ -252,24 +284,17 @@ def do_checkin(page, index: int) -> Dict[str, Any]:
     except Exception as e:
         return {"ok": False, "stage": "click-fail", "message": f"{type(e).__name__}: {e}"}
 
-    deadline = time.time() + 80
-    ts_clicked = False
+    deadline = time.time() + 90
+    ts_attempts = 0
     while time.time() < deadline:
         if captured.get("resp") is not None:
             break
-        # 出现交互式 Turnstile 时自动点一下（跨域 iframe 只能点坐标）
-        if not ts_clicked:
-            try:
-                el = page.query_selector('iframe[src*="challenges.cloudflare.com"]')
-                if el:
-                    box = el.bounding_box()
-                    if box and box.get("width"):
-                        page.mouse.click(box["x"] + 30, box["y"] + box["height"] / 2)
-                        ts_clicked = True
-                        log(f"  账号 {index} 检测到交互式 Turnstile，已尝试点击")
-            except Exception:
-                pass
-        page.wait_for_timeout(400)
+        # 交互式 Turnstile：持续重试（一次点不中很常见）
+        if ts_attempts < 15:
+            if try_click_turnstile(page):
+                ts_attempts += 1
+                log(f"  账号 {index} 第 {ts_attempts} 次点击 Turnstile")
+        page.wait_for_timeout(1200)
 
     resp = captured.get("resp")
     if resp is None:
